@@ -1,12 +1,24 @@
 import json
-import httpx
 import datetime
 import pytz
 from typing import Dict, Any, Optional
 from app.config import settings
 from app.models.schemas import AIAnalysisRequest, AIAnalysisResponse
 
-def generate_fallback_analysis(req: AIAnalysisRequest, is_api_error: bool = False, err_msg: Optional[str] = None) -> AIAnalysisResponse:
+try:
+    from google import genai
+    from google.genai import types
+    HAS_GENAI_SDK = True
+except ImportError:
+    HAS_GENAI_SDK = False
+
+def generate_fallback_analysis(
+    req: AIAnalysisRequest,
+    is_api_error: bool = False,
+    err_msg: Optional[str] = None,
+    was_request_sent: bool = False,
+    used_model: Optional[str] = None
+) -> AIAnalysisResponse:
     """
     Generates a high-quality, deterministic AI decision analysis based directly on empirical historical stats & technical indicators.
     Used when AI_API_KEY is not set or external AI service is unreachable.
@@ -56,6 +68,8 @@ def generate_fallback_analysis(req: AIAnalysisRequest, is_api_error: bool = Fals
     tz = pytz.timezone("Asia/Kolkata")
     now_str = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S IST")
 
+    has_key = bool(settings.AI_API_KEY and settings.AI_API_KEY.strip())
+
     return AIAnalysisResponse(
         recommendation=rec,
         confidence=conf,
@@ -68,25 +82,38 @@ def generate_fallback_analysis(req: AIAnalysisRequest, is_api_error: bool = Fals
         source="fallback",
         ai_status=status_key,
         ai_status_label=status_text,
-        provider=settings.AI_PROVIDER,
-        model=settings.AI_MODEL,
+        provider=settings.AI_PROVIDER or "gemini",
+        model=used_model or settings.AI_MODEL or "gemini-3.6-flash",
         timestamp=now_str,
-        api_key_status="Configured" if settings.AI_API_KEY else "Not Configured",
+        api_key_status="Configured" if has_key else "Not Configured",
+        request_status="Sent" if was_request_sent else "Not Sent",
+        response_status="Fallback",
         error_message=err_msg
     )
 
 async def get_ai_recommendation(req: AIAnalysisRequest) -> AIAnalysisResponse:
     """
-    Constructs financial prompt with empirical statistical context and queries AI API.
+    Constructs financial prompt with empirical statistical context and queries Gemini via official google-genai SDK.
     Logs clear execution events to backend terminal.
     """
     tz = pytz.timezone("Asia/Kolkata")
     now_str = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S IST")
 
-    if not settings.AI_API_KEY or not settings.AI_API_KEY.strip():
+    api_key = settings.AI_API_KEY
+    has_key = bool(api_key and api_key.strip())
+    model_name = settings.AI_MODEL or "gemini-3.6-flash"
+    provider = settings.AI_PROVIDER or "gemini"
+
+    # Terminal Diagnostic Logging
+    print(f"[AI DEBUG] API key configured: {has_key}")
+    print(f"[AI DEBUG] Provider: {provider}")
+    print(f"[AI DEBUG] Model: {model_name}")
+    print(f"[AI DEBUG] Entering Gemini execution path: {has_key}")
+
+    if not has_key:
         print(f"[AI] API key not configured")
         print(f"[AI] Source: FALLBACK")
-        return generate_fallback_analysis(req, is_api_error=False)
+        return generate_fallback_analysis(req, is_api_error=False, was_request_sent=False)
 
     stats = req.analysis_stats
     prompt_text = f"""
@@ -116,96 +143,77 @@ async def get_ai_recommendation(req: AIAnalysisRequest) -> AIAnalysisResponse:
     }}
     """
 
+    print(f"[AI] API key configured")
     print(f"[AI] Gemini request started")
-    print(f"[AI] Model: {settings.AI_MODEL}")
+    print(f"[AI] Model: {model_name}")
 
-    try:
-        if settings.AI_PROVIDER == "gemini":
-            url = settings.AI_ENDPOINT or f"https://generativelanguage.googleapis.com/v1beta/models/{settings.AI_MODEL}:generateContent?key={settings.AI_API_KEY}"
-            payload = {
-                "contents": [{"parts": [{"text": prompt_text}]}],
-                "generationConfig": {"temperature": 0.2, "response_mime_type": "application/json"}
-            }
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                res = await client.post(url, json=payload)
-                if res.status_code == 200:
-                    data = res.json()
-                    raw_text = data['candidates'][0]['content']['parts'][0]['text']
-                    clean_text = raw_text.replace("```json", "").replace("```", "").strip()
-                    parsed = json.loads(clean_text)
-                    
-                    print(f"[AI] Request successful")
-                    print(f"[AI] Response received")
-                    print(f"[AI] Source: AI")
-
-                    return AIAnalysisResponse(
-                        recommendation=parsed.get("recommendation", "HOLD").upper(),
-                        confidence=int(parsed.get("confidence", 70)),
-                        risk_level=parsed.get("risk_level", "MEDIUM").upper(),
-                        summary=parsed.get("summary", ""),
-                        key_factors=parsed.get("key_factors", []),
-                        technical_view=parsed.get("technical_view", ""),
-                        historical_evidence_summary=parsed.get("historical_evidence_summary", ""),
-                        is_fallback=False,
-                        source="ai",
-                        ai_status="connected",
-                        ai_status_label="AI Engine: Connected",
-                        provider=settings.AI_PROVIDER,
-                        model=settings.AI_MODEL,
-                        timestamp=now_str,
-                        api_key_status="Configured"
-                    )
-                else:
-                    err_msg = f"HTTP {res.status_code}: {res.text[:200]}"
-                    print(f"[AI] Gemini request failed: {err_msg}")
-                    print(f"[AI] Source: FALLBACK")
-                    return generate_fallback_analysis(req, is_api_error=True, err_msg=err_msg)
-        elif settings.AI_PROVIDER == "openai":
-            url = "https://api.openai.com/v1/chat/completions"
-            headers = {"Authorization": f"Bearer {settings.AI_API_KEY}"}
-            payload = {
-                "model": settings.AI_MODEL or "gpt-4o-mini",
-                "messages": [{"role": "user", "content": prompt_text}],
-                "response_format": {"type": "json_object"}
-            }
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                res = await client.post(url, json=payload, headers=headers)
-                if res.status_code == 200:
-                    data = res.json()
-                    content = data['choices'][0]['message']['content']
-                    clean_text = content.replace("```json", "").replace("```", "").strip()
-                    parsed = json.loads(clean_text)
-                    
-                    print(f"[AI] Request successful")
-                    print(f"[AI] Response received")
-                    print(f"[AI] Source: AI")
-
-                    return AIAnalysisResponse(
-                        recommendation=parsed.get("recommendation", "HOLD").upper(),
-                        confidence=int(parsed.get("confidence", 70)),
-                        risk_level=parsed.get("risk_level", "MEDIUM").upper(),
-                        summary=parsed.get("summary", ""),
-                        key_factors=parsed.get("key_factors", []),
-                        technical_view=parsed.get("technical_view", ""),
-                        historical_evidence_summary=parsed.get("historical_evidence_summary", ""),
-                        is_fallback=False,
-                        source="ai",
-                        ai_status="connected",
-                        ai_status_label="AI Engine: Connected",
-                        provider=settings.AI_PROVIDER,
-                        model=settings.AI_MODEL,
-                        timestamp=now_str,
-                        api_key_status="Configured"
-                    )
-                else:
-                    err_msg = f"HTTP {res.status_code}: {res.text[:200]}"
-                    print(f"[AI] OpenAI request failed: {err_msg}")
-                    print(f"[AI] Source: FALLBACK")
-                    return generate_fallback_analysis(req, is_api_error=True, err_msg=err_msg)
-    except Exception as e:
-        err_msg = str(e)
+    if not HAS_GENAI_SDK:
+        err_msg = "google-genai SDK not installed"
         print(f"[AI] Gemini request failed: {err_msg}")
         print(f"[AI] Source: FALLBACK")
-        return generate_fallback_analysis(req, is_api_error=True, err_msg=err_msg)
+        return generate_fallback_analysis(req, is_api_error=True, err_msg=err_msg, was_request_sent=True, used_model=model_name)
 
-    return generate_fallback_analysis(req, is_api_error=True)
+    models_to_try = [model_name]
+    for fallback in ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-flash-latest"]:
+        if fallback not in models_to_try:
+            models_to_try.append(fallback)
+
+    last_error = ""
+
+    for target_model in models_to_try:
+        try:
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model=target_model,
+                contents=prompt_text,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.2,
+                ),
+            )
+            
+            raw_text = response.text or ""
+            clean_text = raw_text.replace("```json", "").replace("```", "").strip()
+            parsed = json.loads(clean_text)
+
+            print(f"[AI] Gemini request completed successfully")
+            print(f"[AI] Source: AI")
+
+            return AIAnalysisResponse(
+                recommendation=parsed.get("recommendation", "HOLD").upper(),
+                confidence=int(parsed.get("confidence", 70)),
+                risk_level=parsed.get("risk_level", "MEDIUM").upper(),
+                summary=parsed.get("summary", ""),
+                key_factors=parsed.get("key_factors", []),
+                technical_view=parsed.get("technical_view", ""),
+                historical_evidence_summary=parsed.get("historical_evidence_summary", ""),
+                is_fallback=False,
+                source="ai",
+                ai_status="connected",
+                ai_status_label="AI Engine: Connected",
+                provider=provider,
+                model=target_model,
+                timestamp=now_str,
+                api_key_status="Configured",
+                request_status="Sent",
+                response_status="Received"
+            )
+        except Exception as e:
+            err_str = str(e)
+            err_snippet = err_str[:150].replace("\n", " ")
+            last_error = f"{type(e).__name__}: {err_snippet}"
+            print(f"[AI] Model {target_model} SDK call failed: {last_error}")
+            if "404" in err_str or "NOT_FOUND" in err_str:
+                if target_model != models_to_try[-1]:
+                    print(f"[AI] Trying alternate model fallback...")
+                    continue
+
+    print(f"[AI] Gemini request failed: {last_error}")
+    print(f"[AI] Source: FALLBACK")
+    return generate_fallback_analysis(
+        req,
+        is_api_error=True,
+        err_msg=last_error,
+        was_request_sent=True,
+        used_model=model_name
+    )
